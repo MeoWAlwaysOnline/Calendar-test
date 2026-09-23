@@ -6,9 +6,25 @@
     lilac:'#c793d9', clay:'#e0925c', aqua:'#6fc8c0', olive:'#b7c77a'
   };
   var COLOR_KEYS = Object.keys(COLORS);
+  var CURRENCIES = {UAH:'₴', USD:'$', EUR:'€', GBP:'£', PLN:'zł', RUB:'₽'};
+  var CURRENCY_KEYS = Object.keys(CURRENCIES);
+  var DEFAULT_CURRENCY = 'UAH';
   var DOW_LABELS = ['Пн','Вт','Ср','Чт','Пт','Сб','Вс'];
   var DOW_VALUES = [1,2,3,4,5,6,0];
   var STORAGE_KEY = 'lessoncal_boards_v1';
+  var THEME_KEY = 'lessoncal_theme';
+
+  function getTheme(){
+    try{ return localStorage.getItem(THEME_KEY)==='light' ? 'light' : 'dark'; }
+    catch(e){ return 'dark'; }
+  }
+  function setTheme(t){
+    var theme = (t==='light') ? 'light' : 'dark';
+    try{ localStorage.setItem(THEME_KEY, theme); }catch(e){}
+    document.documentElement.setAttribute('data-theme', theme);
+    state.theme = theme;
+    render();
+  }
 
   var state = {
     boards: [],
@@ -19,8 +35,11 @@
     menuOpen: false,
     storageOk: true,
     pendingImport: null,
-    toast: null,
-    newBoardType: 'lessons'
+    newBoardType: 'lessons',
+    financeView: 'income',
+    theme: getTheme(),
+    editing: null,
+    transactionTarget: null
   };
 
   // ---------- date helpers ----------
@@ -47,16 +66,22 @@
 
   function uid(){ return 'id'+Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
   function newBoard(name, type){
-    return {id: uid(), name: name, type: (type==='events'?'events':'lessons'), subjects: [], events: []};
+    var t = (type==='events') ? 'events' : (type==='finance' ? 'finance' : 'lessons');
+    return {id: uid(), name: name, type: t, subjects: [], events: [], income: [], expenses: [], balances: [], rates: {}, wheelCurrency: ''};
   }
   function activeBoard(){
     var b = state.boards.find(function(x){ return x.id===state.activeBoardId; });
     return b || state.boards[0];
   }
   function normalizeBoard(b){
-    b.type = (b.type==='events') ? 'events' : 'lessons';
+    b.type = (b.type==='events') ? 'events' : (b.type==='finance' ? 'finance' : 'lessons');
     if(!Array.isArray(b.subjects)) b.subjects = [];
     if(!Array.isArray(b.events)) b.events = [];
+    if(!Array.isArray(b.income)) b.income = [];
+    if(!Array.isArray(b.expenses)) b.expenses = [];
+    if(!Array.isArray(b.balances)) b.balances = [];
+    if(!b.rates || typeof b.rates!=='object') b.rates = {};
+    if(typeof b.wheelCurrency!=='string' || CURRENCY_KEYS.indexOf(b.wheelCurrency)===-1) b.wheelCurrency = '';
     b.subjects.forEach(function(s){
       s.planType = (s.planType==='static') ? 'static' : 'dynamic';
       if(typeof s.total!=='number') s.total = s.total ? Number(s.total)||0 : 0;
@@ -67,7 +92,66 @@
       if(!s.rescheduled) s.rescheduled = {};
     });
     b.events.forEach(function(e){ e.yearly = !!e.yearly; });
+    b.income.forEach(function(x){
+      if(typeof x.amount!=='number') x.amount = Number(x.amount)||0;
+      x.scheduleType = (x.scheduleType==='monthly') ? 'monthly' : 'once';
+      if(typeof x.date!=='string') x.date = '';
+      x.currency = (CURRENCY_KEYS.indexOf(x.currency)!==-1) ? x.currency : DEFAULT_CURRENCY;
+      var dom = parseInt(x.dayOfMonth,10);
+      x.dayOfMonth = (dom>=1 && dom<=28) ? dom : 1;
+      if(!Array.isArray(x.history)) x.history = [];
+    });
+    b.expenses.forEach(function(x){
+      if(typeof x.amount!=='number') x.amount = Number(x.amount)||0;
+      x.currency = (CURRENCY_KEYS.indexOf(x.currency)!==-1) ? x.currency : DEFAULT_CURRENCY;
+      if(!Array.isArray(x.history)) x.history = [];
+    });
+    b.balances.forEach(function(x){
+      if(typeof x.amount!=='number') x.amount = Number(x.amount)||0;
+      x.currency = (CURRENCY_KEYS.indexOf(x.currency)!==-1) ? x.currency : DEFAULT_CURRENCY;
+      if(typeof x.label!=='string') x.label = '';
+    });
     return b;
+  }
+
+  function getRate(ab, from, to){
+    if(from===to) return 1;
+    var direct = ab.rates[from+'_'+to];
+    if(typeof direct==='number' && direct>0) return direct;
+    var inverse = ab.rates[to+'_'+from];
+    if(typeof inverse==='number' && inverse>0) return 1/inverse;
+    return null;
+  }
+
+  var ratesLoading = false;
+  function refreshRatesFromApi(display){
+    if(ratesLoading) return;
+    if(typeof fetch!=='function'){ showToast('Автообновление курсов недоступно в этом браузере'); return; }
+    ratesLoading = true;
+    showToast('Обновляем курсы…');
+    fetch('https://open.er-api.com/v6/latest/'+encodeURIComponent(display))
+      .then(function(r){ return r.json(); })
+      .then(function(data){
+        ratesLoading = false;
+        if(!data || data.result!=='success' || !data.rates){
+          showToast('Не удалось получить курсы');
+          return;
+        }
+        var ab = activeBoard();
+        var updated = 0;
+        CURRENCY_KEYS.forEach(function(c){
+          if(c!==display && typeof data.rates[c]==='number' && data.rates[c]>0){
+            ab.rates[c+'_'+display] = 1/data.rates[c];
+            updated++;
+          }
+        });
+        showToast(updated ? 'Курсы обновлены' : 'Курсы не изменились');
+        saveData();
+      })
+      .catch(function(){
+        ratesLoading = false;
+        showToast('Не удалось получить курсы — проверьте подключение к интернету');
+      });
   }
 
   // ---------- scheduling logic (lessons) ----------
@@ -146,6 +230,36 @@
     return fmt(candidate);
   }
 
+  // ---------- finance logic ----------
+  function incomeOccursOn(inc, ds){
+    var d = parseD(ds);
+    if(inc.scheduleType==='monthly') return d.getDate()===inc.dayOfMonth;
+    return inc.date === ds;
+  }
+  function nextIncomeDate(inc){
+    var t = todayD();
+    if(inc.scheduleType==='monthly'){
+      var candidate = new Date(t.getFullYear(), t.getMonth(), inc.dayOfMonth);
+      if(candidate < t) candidate = new Date(t.getFullYear(), t.getMonth()+1, inc.dayOfMonth);
+      return fmt(candidate);
+    }
+    return inc.date >= fmt(t) ? inc.date : null;
+  }
+  function fmtMoney(n, currency){
+    var num;
+    try{ num = Number(n).toLocaleString('ru-RU'); }
+    catch(e){ num = String(n); }
+    if(!currency) return num;
+    var sym = CURRENCIES[currency] || currency;
+    return num + ' ' + sym;
+  }
+  function currenciesUsed(list){
+    var seen = {};
+    var out = [];
+    list.forEach(function(x){ if(!seen[x.currency]){ seen[x.currency]=true; out.push(x.currency); } });
+    return out;
+  }
+
   // ---------- storage (real browser localStorage — persists on any real host, incl. GitHub Pages) ----------
   function loadData(){
     var raw = null;
@@ -178,14 +292,24 @@
 
   // ---------- sharing: the "code" is the board's data itself, base64-encoded ----------
   function encodeBoard(board){
-    try{ return btoa(encodeURIComponent(JSON.stringify({n: board.name, t: board.type, s: board.subjects, e: board.events}))); }
+    try{ return btoa(encodeURIComponent(JSON.stringify({n: board.name, t: board.type, s: board.subjects, e: board.events, i: board.income, x: board.expenses, y: board.balances, r: board.rates, w: board.wheelCurrency}))); }
     catch(e){ return null; }
   }
   function decodeBoard(code){
     var json = decodeURIComponent(atob(code));
     var obj = JSON.parse(json);
     if(!obj || typeof obj.n!=='string') throw new Error('bad payload');
-    var b = {name: obj.n, type: (obj.t==='events'?'events':'lessons'), subjects: Array.isArray(obj.s)?obj.s:[], events: Array.isArray(obj.e)?obj.e:[]};
+    var b = {
+      name: obj.n,
+      type: (obj.t==='events'?'events':(obj.t==='finance'?'finance':'lessons')),
+      subjects: Array.isArray(obj.s)?obj.s:[],
+      events: Array.isArray(obj.e)?obj.e:[],
+      income: Array.isArray(obj.i)?obj.i:[],
+      expenses: Array.isArray(obj.x)?obj.x:[],
+      balances: Array.isArray(obj.y)?obj.y:[],
+      rates: (obj.r && typeof obj.r==='object') ? obj.r : {},
+      wheelCurrency: typeof obj.w==='string' ? obj.w : ''
+    };
     return b;
   }
   function checkHashImport(){
@@ -195,7 +319,7 @@
       try{
         var code = decodeURIComponent(raw);
         var decoded = decodeBoard(code);
-        state.pendingImport = {code: code, name: decoded.name, type: decoded.type, subjects: decoded.subjects, events: decoded.events};
+        state.pendingImport = {code: code, name: decoded.name, type: decoded.type, subjects: decoded.subjects, events: decoded.events, income: decoded.income, expenses: decoded.expenses, balances: decoded.balances, rates: decoded.rates, wheelCurrency: decoded.wheelCurrency};
       }catch(e){ /* ignore malformed hash */ }
     }
   }
@@ -210,11 +334,17 @@
     state.boards.push(b);
     state.activeBoardId = b.id;
     state.menuOpen = false;
+    state.financeView = 'income';
+    state.editing = null;
+    state.transactionTarget = null;
     saveData();
   }
   function switchBoard(id){
     state.activeBoardId = id;
     state.menuOpen = false;
+    state.financeView = 'income';
+    state.editing = null;
+    state.transactionTarget = null;
     saveData();
   }
   function deleteBoard(id){
@@ -228,6 +358,11 @@
     var b = newBoard(state.pendingImport.name, state.pendingImport.type);
     b.subjects = state.pendingImport.subjects;
     b.events = state.pendingImport.events;
+    b.income = state.pendingImport.income || [];
+    b.expenses = state.pendingImport.expenses || [];
+    b.balances = state.pendingImport.balances || [];
+    b.rates = state.pendingImport.rates || {};
+    b.wheelCurrency = state.pendingImport.wheelCurrency || '';
     normalizeBoard(b);
     state.boards.push(b);
     state.activeBoardId = b.id;
@@ -314,6 +449,106 @@
     b.events = b.events.filter(function(e){ return e.id!==id; });
     saveData();
   }
+  function updateEvent(id, data){
+    var b = activeBoard();
+    var e = b.events.find(function(x){ return x.id===id; });
+    if(!e) return;
+    e.name = data.name; e.color = data.color; e.date = data.date; e.yearly = !!data.yearly;
+    saveData();
+  }
+
+  // ---------- finance mutations ----------
+  function addIncome(data){
+    var b = activeBoard();
+    b.income.push({
+      id: uid(), name: data.name, color: data.color, amount: data.amount, currency: data.currency,
+      scheduleType: data.scheduleType, date: data.date || '', dayOfMonth: data.dayOfMonth || 1
+    });
+    saveData();
+  }
+  function updateIncome(id, data){
+    var b = activeBoard();
+    var x = b.income.find(function(v){ return v.id===id; });
+    if(!x) return;
+    x.name = data.name; x.color = data.color; x.amount = data.amount; x.currency = data.currency;
+    x.scheduleType = data.scheduleType; x.date = data.date || ''; x.dayOfMonth = data.dayOfMonth || 1;
+    saveData();
+  }
+  function deleteIncome(id){
+    var b = activeBoard();
+    b.income = b.income.filter(function(x){ return x.id!==id; });
+    saveData();
+  }
+  function addExpense(data){
+    var b = activeBoard();
+    b.expenses.push({id: uid(), name: data.name, color: data.color, amount: data.amount, currency: data.currency});
+    saveData();
+  }
+  function updateExpense(id, data){
+    var b = activeBoard();
+    var x = b.expenses.find(function(v){ return v.id===id; });
+    if(!x) return;
+    x.name = data.name; x.color = data.color; x.amount = data.amount; x.currency = data.currency;
+    saveData();
+  }
+  function deleteExpense(id){
+    var b = activeBoard();
+    b.expenses = b.expenses.filter(function(x){ return x.id!==id; });
+    saveData();
+  }
+
+  // ---------- balance mutations ----------
+  function addBalance(data){
+    var b = activeBoard();
+    b.balances.push({id: uid(), label: data.label || '', currency: data.currency, amount: data.amount});
+    saveData();
+  }
+  function updateBalance(id, data){
+    var b = activeBoard();
+    var x = b.balances.find(function(v){ return v.id===id; });
+    if(!x) return;
+    x.label = data.label || ''; x.currency = data.currency; x.amount = data.amount;
+    saveData();
+  }
+  function deleteBalance(id){
+    var b = activeBoard();
+    b.balances = b.balances.filter(function(x){ return x.id!==id; });
+    saveData();
+  }
+
+  // ---------- transactions: add an amount to an income/expense card and move a chosen balance account ----------
+  function addTransaction(kind, id, amount, balanceId, date){
+    var b = activeBoard();
+    var list = kind==='income' ? b.income : b.expenses;
+    var item = list.find(function(x){ return x.id===id; });
+    if(!item) return null;
+    item.amount = Math.max(0, item.amount + amount);
+    var bal = balanceId ? b.balances.find(function(x){ return x.id===balanceId; }) : null;
+    var found = !!bal;
+    if(bal){
+      bal.amount += (kind==='income' ? amount : -amount);
+    }
+    if(!Array.isArray(item.history)) item.history = [];
+    item.history.push({id: uid(), date: date || fmt(todayD()), amount: amount, balanceId: found ? balanceId : null});
+    saveData();
+    return found;
+  }
+  function deleteTransaction(kind, itemId, historyId){
+    var b = activeBoard();
+    var list = kind==='income' ? b.income : b.expenses;
+    var item = list.find(function(x){ return x.id===itemId; });
+    if(!item || !Array.isArray(item.history)) return;
+    var idx = item.history.findIndex(function(h){ return h.id===historyId; });
+    if(idx===-1) return;
+    var h = item.history[idx];
+    item.amount = Math.max(0, item.amount - h.amount);
+    if(h.balanceId){
+      var bal = b.balances.find(function(x){ return x.id===h.balanceId; });
+      if(bal){ bal.amount -= (kind==='income' ? h.amount : -h.amount); }
+    }
+    item.history.splice(idx, 1);
+    saveData();
+  }
 
   // ---------- render ----------
   var app = document.getElementById('app');
@@ -326,19 +561,34 @@
     html += renderSidebar();
     html += renderCalendar();
     html += '</div>';
-    if(state.modal==='add') html += (activeBoard().type==='events' ? renderAddEventModal() : renderAddSubjectModal());
-    if(state.modal==='day') html += (activeBoard().type==='events' ? renderEventDayModal() : renderLessonDayModal());
+    if(state.modal==='add') html += renderAddModal();
+    if(state.modal==='day') html += renderDayModal();
+    if(state.modal==='balance') html += renderBalanceModal();
+    if(state.modal==='transaction') html += renderTransactionModal();
+    if(state.modal==='rates') html += renderRatesModal();
+    if(state.modal==='history') html += renderTransactionHistoryModal();
     if(state.menuOpen) html += renderMenuDrawer();
-    if(state.toast) html += '<div class="toast">'+escapeHtml(state.toast)+'</div>';
     app.innerHTML = html;
     attachHandlers();
-    if(state.toast){ setTimeout(function(){ state.toast=null; render(); }, 2400); }
   }
 
   function escapeHtml(s){
     return String(s).replace(/[&<>"']/g, function(c){
       return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
     });
+  }
+
+  function renderAddModal(){
+    var ab = activeBoard();
+    if(ab.type==='events') return renderAddEventModal();
+    if(ab.type==='finance') return state.financeView==='expenses' ? renderAddExpenseModal() : renderAddIncomeModal();
+    return renderAddSubjectModal();
+  }
+  function renderDayModal(){
+    var ab = activeBoard();
+    if(ab.type==='events') return renderEventDayModal();
+    if(ab.type==='finance') return renderFinanceDayModal();
+    return renderLessonDayModal();
   }
 
   function renderImportBanner(){
@@ -355,18 +605,26 @@
   function renderHeader(){
     var vd = state.viewDate;
     var ab = activeBoard();
+    var typeLabel = ab.type==='events' ? 'события' : (ab.type==='finance' ? 'финансы' : 'занятия');
     var storageWarn = state.storageOk ? '' :
       '<div class="storage-warn">Локальное хранилище браузера недоступно (например, приватный режим) — изменения не сохранятся.</div>';
+    var financeToggle = '';
+    if(ab.type==='finance'){
+      financeToggle = ''+
+        '<button class="btn small'+(state.financeView==='income'?' primary':'')+'" data-act="finance-view" data-view="income">Доходы</button>'+
+        '<button class="btn small'+(state.financeView==='expenses'?' primary':'')+'" data-act="finance-view" data-view="expenses">Расходы</button>';
+    }
     return ''+
       '<header class="top">'+
         '<div class="top-left">'+
           '<button class="icon-btn" data-act="open-menu" title="Доски">☰</button>'+
-          '<div><h1 class="display">Календарь<span>Доска: <b>'+escapeHtml(ab.name)+'</b> · '+(ab.type==='events'?'события':'занятия')+'</span></h1></div>'+
+          '<div><h1 class="display">Календарь<span>Доска: <b>'+escapeHtml(ab.name)+'</b> · '+typeLabel+'</span></h1></div>'+
         '</div>'+
         '<div class="month-nav">'+
           '<button class="icon-btn" data-act="prev-month">‹</button>'+
           '<div class="label mono">'+MONTH_NAMES[vd.getMonth()]+' '+vd.getFullYear()+'</div>'+
           '<button class="icon-btn" data-act="next-month">›</button>'+
+          financeToggle+
           '<button class="btn small" data-act="today">Сегодня</button>'+
         '</div>'+
       '</header>'+
@@ -375,7 +633,9 @@
 
   function renderSidebar(){
     var ab = activeBoard();
-    return ab.type==='events' ? renderEventsSidebar(ab) : renderLessonsSidebar(ab);
+    if(ab.type==='events') return renderEventsSidebar(ab);
+    if(ab.type==='finance') return state.financeView==='expenses' ? renderExpensesSidebar(ab) : renderIncomeSidebar(ab);
+    return renderLessonsSidebar(ab);
   }
 
   function renderLessonsSidebar(ab){
@@ -484,7 +744,10 @@
           '<div class="notch left"></div><div class="notch right"></div><div class="perf"></div>'+
           '<div class="pc-head">'+
             '<div class="pc-name"><span class="dot" style="background:'+color+'"></span><span class="txt">'+escapeHtml(ev.name)+'</span></div>'+
-            '<button class="icon-btn" data-act="delete-event" data-id="'+ev.id+'" title="Удалить" style="width:26px;height:26px;font-size:13px;">✕</button>'+
+            '<div style="display:flex;gap:4px;">'+
+              '<button class="icon-btn" data-act="edit-event" data-id="'+ev.id+'" title="Изменить" style="width:26px;height:26px;font-size:12px;">✎</button>'+
+              '<button class="icon-btn" data-act="delete-event" data-id="'+ev.id+'" title="Удалить" style="width:26px;height:26px;font-size:13px;">✕</button>'+
+            '</div>'+
           '</div>'+
           '<div class="pc-body">'+
             '<div class="pc-stats">'+line1+'<br>'+line2+'</div>'+
@@ -497,7 +760,111 @@
     return html;
   }
 
+  function renderBalanceWidget(ab){
+    var totals = {};
+    var order = [];
+    ab.balances.forEach(function(x){
+      if(!totals[x.currency]){ totals[x.currency]=0; order.push(x.currency); }
+      totals[x.currency] += x.amount;
+    });
+    var summary = order.length ? order.map(function(c){ return fmtMoney(totals[c], c); }).join(' · ') : 'Добавить баланс';
+    return ''+
+      '<button class="balance-widget" data-act="open-balance">'+
+        '<div class="balance-widget-label">Баланс</div>'+
+        '<div class="balance-widget-value mono">'+escapeHtml(summary)+'</div>'+
+      '</button>';
+  }
+
+  function renderIncomeSidebar(ab){
+    var html = '<div class="sidebar">'+renderBalanceWidget(ab)+'<h2>Доходы</h2><div class="cards">';
+    if(ab.income.length===0){
+      html += '<div class="empty" style="padding:20px 6px;"><div class="display">Пока пусто</div>Добавьте зарплату, инвестиции или другой источник дохода.</div>';
+    }
+    var sorted = ab.income.slice().sort(function(a,b){
+      var na = nextIncomeDate(a), nb = nextIncomeDate(b);
+      if(!na && !nb) return 0;
+      if(!na) return 1;
+      if(!nb) return -1;
+      return na < nb ? -1 : 1;
+    });
+    sorted.forEach(function(inc){
+      var color = COLORS[inc.color] || COLORS.amber;
+      var line1 = inc.scheduleType==='monthly' ? ('Ежемесячно · '+inc.dayOfMonth+' числа') : ('Разово · '+fmtHuman(inc.date));
+      var next = nextIncomeDate(inc);
+      var line2;
+      if(next){
+        var dl = daysUntil(next);
+        if(dl===0) line2 = '<b style="color:var(--amber)">Сегодня!</b>';
+        else line2 = 'через '+dl+' дн.';
+      } else {
+        line2 = '<span class="dim">прошло</span>';
+      }
+      html += ''+
+        '<div class="punch-card">'+
+          '<div class="notch left"></div><div class="notch right"></div><div class="perf"></div>'+
+          '<div class="pc-head">'+
+            '<div class="pc-name"><span class="dot" style="background:'+color+'"></span><span class="txt">'+escapeHtml(inc.name)+'</span></div>'+
+            '<div style="display:flex;gap:4px;">'+
+              '<button class="icon-btn" data-act="add-transaction" data-kind="income" data-id="'+inc.id+'" title="Добавить сумму" style="width:26px;height:26px;font-size:14px;">+</button>'+
+              '<button class="icon-btn" data-act="edit-income" data-id="'+inc.id+'" title="Изменить" style="width:26px;height:26px;font-size:12px;">✎</button>'+
+              '<button class="icon-btn" data-act="delete-income" data-id="'+inc.id+'" title="Удалить" style="width:26px;height:26px;font-size:13px;">✕</button>'+
+            '</div>'+
+          '</div>'+
+          '<div class="pc-body">'+
+            '<div class="pc-stats"><b>'+fmtMoney(inc.amount, inc.currency)+'</b><br>'+line1+'<br>'+line2+'</div>'+
+          '</div>'+
+        '</div>';
+    });
+    html += '</div>';
+    html += '<button class="add-card" data-act="open-add">+ Добавить доход</button>';
+    html += '</div>';
+    return html;
+  }
+
+  function renderExpensesSidebar(ab){
+    var html = '<div class="sidebar">'+renderBalanceWidget(ab)+'<h2>Расходы</h2><div class="cards">';
+    if(ab.expenses.length===0){
+      html += '<div class="empty" style="padding:20px 6px;"><div class="display">Пока пусто</div>Добавьте статьи расходов, чтобы увидеть их на колесе.</div>';
+    }
+    var totalsByCur = {};
+    ab.expenses.forEach(function(e){ totalsByCur[e.currency] = (totalsByCur[e.currency]||0) + e.amount; });
+    ab.expenses.forEach(function(exp){
+      var color = COLORS[exp.color] || COLORS.amber;
+      var curTotal = totalsByCur[exp.currency] || 0;
+      var pct = curTotal>0 ? Math.round(exp.amount/curTotal*100) : 0;
+      html += ''+
+        '<div class="punch-card">'+
+          '<div class="notch left"></div><div class="notch right"></div><div class="perf"></div>'+
+          '<div class="pc-head">'+
+            '<div class="pc-name"><span class="dot" style="background:'+color+'"></span><span class="txt">'+escapeHtml(exp.name)+'</span></div>'+
+            '<div style="display:flex;gap:4px;">'+
+              '<button class="icon-btn" data-act="add-transaction" data-kind="expense" data-id="'+exp.id+'" title="Добавить сумму" style="width:26px;height:26px;font-size:14px;">+</button>'+
+              '<button class="icon-btn" data-act="edit-expense" data-id="'+exp.id+'" title="Изменить" style="width:26px;height:26px;font-size:12px;">✎</button>'+
+              '<button class="icon-btn" data-act="delete-expense" data-id="'+exp.id+'" title="Удалить" style="width:26px;height:26px;font-size:13px;">✕</button>'+
+            '</div>'+
+          '</div>'+
+          '<div class="pc-body">'+
+            '<div class="pc-stats"><b>'+fmtMoney(exp.amount, exp.currency)+'</b><br>'+pct+'% от расходов в '+(CURRENCIES[exp.currency]||exp.currency)+'</div>'+
+          '</div>'+
+        '</div>';
+    });
+    html += '</div>';
+    html += '<button class="add-card" data-act="open-add">+ Добавить расход</button>';
+    html += '</div>';
+    return html;
+  }
+
   function renderCalendar(){
+    var ab = activeBoard();
+    var compact = (ab.type==='finance' && state.financeView==='expenses');
+    var html = '<div class="cal-col">';
+    html += renderCalendarGrid(compact);
+    if(compact) html += renderExpenseWheel(ab);
+    html += '</div>';
+    return html;
+  }
+
+  function renderCalendarGrid(compact){
     var vd = state.viewDate;
     var ab = activeBoard();
     var y = vd.getFullYear(), m = vd.getMonth();
@@ -522,6 +889,24 @@
           var cls = 'marker' + (ds<=todayStr ? '' : ' outline');
           markers += '<span class="'+cls+'" title="'+escapeHtml(ev.name)+'" style="--mc:'+color+'"></span>';
         });
+      } else if(ab.type==='finance'){
+        ab.income.forEach(function(inc){
+          var scheduled = incomeOccursOn(inc, ds);
+          var histEntry = (inc.history||[]).find(function(h){ return h.date===ds; });
+          if(!scheduled && !histEntry) return;
+          var color = COLORS[inc.color] || COLORS.amber;
+          var cls = 'marker' + (ds<=todayStr ? '' : ' outline');
+          var tt = histEntry ? (inc.name+' · +'+fmtMoney(histEntry.amount, inc.currency)) : (inc.name+' · '+fmtMoney(inc.amount, inc.currency));
+          markers += '<span class="'+cls+'" title="'+escapeHtml(tt)+'" style="--mc:'+color+'"></span>';
+        });
+        ab.expenses.forEach(function(exp){
+          var histEntry = (exp.history||[]).find(function(h){ return h.date===ds; });
+          if(!histEntry) return;
+          var color = COLORS[exp.color] || COLORS.amber;
+          var cls = 'marker' + (ds<=todayStr ? '' : ' outline');
+          var tt = exp.name+' · -'+fmtMoney(histEntry.amount, exp.currency);
+          markers += '<span class="'+cls+'" title="'+escapeHtml(tt)+'" style="--mc:'+color+'"></span>';
+        });
       } else {
         ab.subjects.forEach(function(s){
           var info = dayInfo(s, ds);
@@ -542,7 +927,92 @@
           '<div class="cal-markers">'+markers+'</div>'+
         '</div>';
     }
-    return '<div class="cal-wrap">'+dowRow+'<div class="cal-grid">'+cells+'</div></div>';
+    return '<div class="cal-wrap'+(compact?' compact':'')+'">'+dowRow+'<div class="cal-grid">'+cells+'</div></div>';
+  }
+
+  function renderExpenseWheel(ab){
+    var curs = currenciesUsed(ab.expenses);
+    var display = (ab.wheelCurrency && CURRENCY_KEYS.indexOf(ab.wheelCurrency)!==-1) ? ab.wheelCurrency : (curs[0] || DEFAULT_CURRENCY);
+    var controlsHtml = ''+
+      '<div class="wheel-controls">'+
+        '<label class="mono">Колесо в:</label>'+
+        '<select data-act="set-wheel-currency">'+
+          CURRENCY_KEYS.map(function(c){ return '<option value="'+c+'"'+(c===display?' selected':'')+'>'+c+' ('+CURRENCIES[c]+')</option>'; }).join('')+
+        '</select>'+
+        '<button type="button" class="btn small" data-act="refresh-rates" data-to="'+display+'">Обновить курсы</button>'+
+        '<button type="button" class="btn small" data-act="open-rates">Курсы валют</button>'+
+        '<button type="button" class="btn small" data-act="open-history">История транзакций</button>'+
+      '</div>';
+    if(ab.expenses.length===0){
+      return controlsHtml + '<div class="empty" style="padding:24px 10px;"><div class="display">Колесо пусто</div>Добавьте расходы слева, чтобы увидеть распределение.</div>';
+    }
+
+    var missing = [];
+    var items = ab.expenses.map(function(exp){
+      var rate = getRate(ab, exp.currency, display);
+      var known = rate!==null;
+      if(!known){ rate = 1; if(missing.indexOf(exp.currency)===-1 && exp.currency!==display) missing.push(exp.currency); }
+      return {exp: exp, val: exp.amount*rate, known: known};
+    });
+    var total = items.reduce(function(s,it){ return s+it.val; }, 0);
+
+    var selectorHtml = controlsHtml;
+
+    var rateHtml = '';
+    if(missing.length){
+      rateHtml = '<div class="wheel-rate-warning">Не удалось найти курс автоматически — введите вручную:'+
+        missing.map(function(c){
+          return '<div class="rate-row"><span class="mono">1 '+c+' ('+CURRENCIES[c]+') = </span>'+
+            '<input type="number" step="0.0001" min="0" placeholder="курс" data-act="set-rate" data-from="'+c+'" data-to="'+display+'">'+
+            '<span class="mono">'+display+'</span></div>';
+        }).join('')+
+      '</div>';
+    }
+
+    if(total<=0){
+      var flatLegend = ab.expenses.map(function(exp){
+        var color = COLORS[exp.color] || COLORS.amber;
+        return '<div class="wheel-legend-item"><span class="dot" style="background:'+color+'"></span><span>'+escapeHtml(exp.name)+'</span><span class="pct">'+fmtMoney(exp.amount, exp.currency)+'</span></div>';
+      }).join('');
+      return selectorHtml + rateHtml + ''+
+      '<div class="finance-wheel-wrap">'+
+        '<div class="wheel-outer" style="background:var(--surface-2);">'+
+          '<div class="wheel-hole"><div class="wheel-total mono" style="font-size:12px;">0</div><div class="mono" style="font-size:10px;color:var(--ink-faint);">пока нечего делить</div></div>'+
+        '</div>'+
+        '<div class="wheel-legend">'+flatLegend+'</div>'+
+      '</div>';
+    }
+
+    var cum = 0;
+    var stops = [];
+    var legend = '';
+    items.forEach(function(it){
+      var exp = it.exp;
+      var color = COLORS[exp.color] || COLORS.amber;
+      var pct = it.val/total*100;
+      var start = cum;
+      cum += pct;
+      stops.push(color+' '+start.toFixed(2)+'% '+cum.toFixed(2)+'%');
+      var shown = fmtMoney(exp.amount, exp.currency);
+      var extra = '';
+      if(exp.currency!==display){
+        extra = it.known ? (' ≈ '+fmtMoney(it.val, display)) : ' <span style="color:var(--rose)">— нужен курс</span>';
+      }
+      legend += ''+
+        '<div class="wheel-legend-item">'+
+          '<span class="dot" style="background:'+color+'"></span>'+
+          '<span>'+escapeHtml(exp.name)+'</span>'+
+          '<span class="pct">'+shown+extra+' · '+Math.round(pct)+'%</span>'+
+        '</div>';
+    });
+    var gradient = 'conic-gradient('+stops.join(', ')+')';
+    return selectorHtml + rateHtml + ''+
+    '<div class="finance-wheel-wrap">'+
+      '<div class="wheel-outer" style="background:'+gradient+'">'+
+        '<div class="wheel-hole"><div class="wheel-total">'+fmtMoney(total, display)+'</div><div class="mono" style="font-size:10px;color:var(--ink-faint);">всего</div></div>'+
+      '</div>'+
+      '<div class="wheel-legend">'+legend+'</div>'+
+    '</div>';
   }
 
   function renderAddSubjectModal(){
@@ -589,28 +1059,31 @@
   }
 
   function renderAddEventModal(){
+    var editing = (state.editing && state.editing.kind==='event') ? activeBoard().events.find(function(x){ return x.id===state.editing.id; }) : null;
     return ''+
     '<div class="overlay">'+
       '<div class="modal" data-stop="1">'+
         '<button class="close-x" data-act="close-modal">✕</button>'+
-        '<h3 class="display">Новое событие</h3>'+
+        '<h3 class="display">'+(editing?'Изменить событие':'Новое событие')+'</h3>'+
         '<div class="sub">Например, день рождения или разовое напоминание</div>'+
         '<form id="add-event-form">'+
-          '<div class="field"><label>Название</label><input type="text" name="name" placeholder="Например, день рождения" required></div>'+
+          (editing?'<input type="hidden" name="editId" value="'+editing.id+'">':'')+
+          '<div class="field"><label>Название</label><input type="text" name="name" placeholder="Например, день рождения Иры" value="'+(editing?escapeHtml(editing.name):'')+'" required></div>'+
           '<div class="field"><label>Цвет</label><div class="color-picker">'+
-            COLOR_KEYS.map(function(k,idx){
-              return '<div class="swatch'+(idx===0?' active':'')+'" data-color="'+k+'" style="background:'+COLORS[k]+'"></div>';
+            COLOR_KEYS.map(function(k){
+              var active = editing ? (editing.color===k) : (k===COLOR_KEYS[0]);
+              return '<div class="swatch'+(active?' active':'')+'" data-color="'+k+'" style="background:'+COLORS[k]+'"></div>';
             }).join('')+
-          '</div><input type="hidden" name="color" value="'+COLOR_KEYS[0]+'"></div>'+
-          '<div class="field"><label>Дата</label><input type="date" name="date" value="'+fmt(todayD())+'" required></div>'+
+          '</div><input type="hidden" name="color" value="'+(editing?editing.color:COLOR_KEYS[0])+'"></div>'+
+          '<div class="field"><label>Дата</label><input type="date" name="date" value="'+(editing?editing.date:fmt(todayD()))+'" required></div>'+
           '<div class="field">'+
             '<label style="display:flex; align-items:center; gap:8px; cursor:pointer;">'+
-              '<input type="checkbox" name="yearly" style="width:16px;height:16px;"> Повторять каждый год'+
+              '<input type="checkbox" name="yearly" style="width:16px;height:16px;"'+(editing&&editing.yearly?' checked':'')+'> Повторять каждый год'+
             '</label>'+
           '</div>'+
           '<div class="modal-actions">'+
             '<button type="button" class="btn" data-act="close-modal">Отмена</button>'+
-            '<button type="submit" class="btn primary">Добавить событие</button>'+
+            '<button type="submit" class="btn primary">'+(editing?'Сохранить':'Добавить событие')+'</button>'+
           '</div>'+
         '</form>'+
       '</div>'+
@@ -697,10 +1170,304 @@
     '</div>';
   }
 
+  function currencyOptionsHtml(selected){
+    return CURRENCY_KEYS.map(function(c){
+      return '<option value="'+c+'"'+(c===selected?' selected':'')+'>'+c+' ('+CURRENCIES[c]+')</option>';
+    }).join('');
+  }
+
+  function renderAddIncomeModal(){
+    var editing = (state.editing && state.editing.kind==='income') ? activeBoard().income.find(function(x){ return x.id===state.editing.id; }) : null;
+    var isMonthly = editing && editing.scheduleType==='monthly';
+    return ''+
+    '<div class="overlay">'+
+      '<div class="modal" data-stop="1">'+
+        '<button class="close-x" data-act="close-modal">✕</button>'+
+        '<h3 class="display">'+(editing?'Изменить доход':'Новый доход')+'</h3>'+
+        '<div class="sub">Зарплата, инвестиции или другой источник дохода</div>'+
+        '<form id="add-income-form">'+
+          (editing?'<input type="hidden" name="editId" value="'+editing.id+'">':'')+
+          '<div class="field"><label>Название</label><input type="text" name="name" placeholder="Например, зарплата" value="'+(editing?escapeHtml(editing.name):'')+'" required></div>'+
+          '<div class="field-row">'+
+            '<div class="field" style="flex:2;"><label>Сумма</label><input type="number" name="amount" min="0" step="0.01" placeholder="0" value="'+(editing?editing.amount:'')+'" required></div>'+
+            '<div class="field" style="flex:1;"><label>Валюта</label><select name="currency">'+currencyOptionsHtml(editing?editing.currency:DEFAULT_CURRENCY)+'</select></div>'+
+          '</div>'+
+          '<div class="field"><label>Цвет</label><div class="color-picker">'+
+            COLOR_KEYS.map(function(k){
+              var active = editing ? (editing.color===k) : (k===COLOR_KEYS[0]);
+              return '<div class="swatch'+(active?' active':'')+'" data-color="'+k+'" style="background:'+COLORS[k]+'"></div>';
+            }).join('')+
+          '</div><input type="hidden" name="color" value="'+(editing?editing.color:COLOR_KEYS[0])+'"></div>'+
+          '<div class="field">'+
+            '<label>Периодичность</label>'+
+            '<div class="toggle-row">'+
+              '<button type="button" class="toggle-btn'+(!isMonthly?' active':'')+'" data-schedule="once">Разово</button>'+
+              '<button type="button" class="toggle-btn'+(isMonthly?' active':'')+'" data-schedule="monthly">Ежемесячно</button>'+
+            '</div>'+
+            '<input type="hidden" name="scheduleType" value="'+(isMonthly?'monthly':'once')+'">'+
+          '</div>'+
+          '<div class="field" data-schedule-field="once" style="'+(isMonthly?'display:none;':'')+'"><label>Дата</label><input type="date" name="date" value="'+(editing&&editing.date?editing.date:fmt(todayD()))+'"></div>'+
+          '<div class="field" data-schedule-field="monthly" style="'+(isMonthly?'':'display:none;')+'"><label>Число месяца</label><input type="number" name="dayOfMonth" min="1" max="28" value="'+(editing?editing.dayOfMonth:1)+'"></div>'+
+          '<div class="modal-actions">'+
+            '<button type="button" class="btn" data-act="close-modal">Отмена</button>'+
+            '<button type="submit" class="btn primary">'+(editing?'Сохранить':'Добавить доход')+'</button>'+
+          '</div>'+
+        '</form>'+
+      '</div>'+
+    '</div>';
+  }
+
+  function renderAddExpenseModal(){
+    var editing = (state.editing && state.editing.kind==='expense') ? activeBoard().expenses.find(function(x){ return x.id===state.editing.id; }) : null;
+    return ''+
+    '<div class="overlay">'+
+      '<div class="modal" data-stop="1">'+
+        '<button class="close-x" data-act="close-modal">✕</button>'+
+        '<h3 class="display">'+(editing?'Изменить расход':'Новый расход')+'</h3>'+
+        '<div class="sub">Появится как доля на колесе расходов</div>'+
+        '<form id="add-expense-form">'+
+          (editing?'<input type="hidden" name="editId" value="'+editing.id+'">':'')+
+          '<div class="field"><label>Название</label><input type="text" name="name" placeholder="Например, аренда" value="'+(editing?escapeHtml(editing.name):'')+'" required></div>'+
+          '<div class="field-row">'+
+            '<div class="field" style="flex:2;"><label>Сумма</label><input type="number" name="amount" min="0" step="0.01" placeholder="0" value="'+(editing?editing.amount:'')+'" required></div>'+
+            '<div class="field" style="flex:1;"><label>Валюта</label><select name="currency">'+currencyOptionsHtml(editing?editing.currency:DEFAULT_CURRENCY)+'</select></div>'+
+          '</div>'+
+          '<div class="field"><label>Цвет</label><div class="color-picker">'+
+            COLOR_KEYS.map(function(k){
+              var active = editing ? (editing.color===k) : (k===COLOR_KEYS[0]);
+              return '<div class="swatch'+(active?' active':'')+'" data-color="'+k+'" style="background:'+COLORS[k]+'"></div>';
+            }).join('')+
+          '</div><input type="hidden" name="color" value="'+(editing?editing.color:COLOR_KEYS[0])+'"></div>'+
+          '<div class="modal-actions">'+
+            '<button type="button" class="btn" data-act="close-modal">Отмена</button>'+
+            '<button type="submit" class="btn primary">'+(editing?'Сохранить':'Добавить расход')+'</button>'+
+          '</div>'+
+        '</form>'+
+      '</div>'+
+    '</div>';
+  }
+
+  function renderFinanceDayModal(){
+    var ds = state.selectedDate;
+    var ab = activeBoard();
+    var items = '';
+    var any = false;
+    ab.income.forEach(function(inc){
+      var color = COLORS[inc.color] || COLORS.amber;
+      if(incomeOccursOn(inc, ds)){
+        any = true;
+        var head = '<div class="day-item-head"><span class="dot" style="background:'+color+'"></span><span class="nm">'+escapeHtml(inc.name)+'</span><span class="mono" style="font-size:11px;color:var(--ink-dim);">'+fmtMoney(inc.amount, inc.currency)+'</span></div>';
+        var body = (inc.scheduleType==='monthly' ? '<div class="status ok">Повторяется ежемесячно</div>' : '<div class="status">Разовый доход</div>')+
+          '<div class="row-actions"><button class="btn small danger" data-act="delete-income" data-id="'+inc.id+'">Удалить</button></div>';
+        items += '<div class="day-item">'+head+body+'</div>';
+      }
+      (inc.history||[]).filter(function(h){ return h.date===ds; }).forEach(function(h){
+        any = true;
+        var head = '<div class="day-item-head"><span class="dot" style="background:'+color+'"></span><span class="nm">'+escapeHtml(inc.name)+' · пополнение</span><span class="mono" style="font-size:11px;color:var(--sage);">+'+fmtMoney(h.amount, inc.currency)+'</span></div>';
+        var body = '<div class="row-actions"><button class="btn small danger" data-act="delete-transaction" data-kind="income" data-item="'+inc.id+'" data-hist="'+h.id+'">Удалить запись</button></div>';
+        items += '<div class="day-item">'+head+body+'</div>';
+      });
+    });
+    ab.expenses.forEach(function(exp){
+      var color = COLORS[exp.color] || COLORS.amber;
+      (exp.history||[]).filter(function(h){ return h.date===ds; }).forEach(function(h){
+        any = true;
+        var head = '<div class="day-item-head"><span class="dot" style="background:'+color+'"></span><span class="nm">'+escapeHtml(exp.name)+' · трата</span><span class="mono" style="font-size:11px;color:var(--rose);">-'+fmtMoney(h.amount, exp.currency)+'</span></div>';
+        var body = '<div class="row-actions"><button class="btn small danger" data-act="delete-transaction" data-kind="expense" data-item="'+exp.id+'" data-hist="'+h.id+'">Удалить запись</button></div>';
+        items += '<div class="day-item">'+head+body+'</div>';
+      });
+    });
+    if(!any){
+      items = '<div class="empty" style="padding:20px 6px;">На этот день ничего не запланировано.</div>';
+    }
+    return ''+
+    '<div class="overlay">'+
+      '<div class="modal" data-stop="1">'+
+        '<button class="close-x" data-act="close-modal">✕</button>'+
+        '<h3 class="display">'+fmtHuman(ds)+'</h3>'+
+        '<div class="sub">Финансы за этот день</div>'+
+        items+
+      '</div>'+
+    '</div>';
+  }
+
+  function renderBalanceModal(){
+    var ab = activeBoard();
+    var editing = (state.editing && state.editing.kind==='balance') ? ab.balances.find(function(x){ return x.id===state.editing.id; }) : null;
+    var rows = '';
+    ab.balances.forEach(function(x){
+      rows += ''+
+        '<div class="day-item">'+
+          '<div class="day-item-head">'+
+            '<span class="nm">'+(x.label?escapeHtml(x.label)+' · ':'')+fmtMoney(x.amount, x.currency)+'</span>'+
+          '</div>'+
+          '<div class="row-actions">'+
+            '<button class="btn small" data-act="edit-balance" data-id="'+x.id+'">Изменить</button>'+
+            '<button class="btn small danger" data-act="delete-balance" data-id="'+x.id+'">Удалить</button>'+
+          '</div>'+
+        '</div>';
+    });
+    if(!rows){
+      rows = '<div class="empty" style="padding:16px 6px;">Пока нет ни одной записи баланса.</div>';
+    }
+    return ''+
+    '<div class="overlay">'+
+      '<div class="modal" data-stop="1">'+
+        '<button class="close-x" data-act="close-modal">✕</button>'+
+        '<h3 class="display">Баланс</h3>'+
+        '<div class="sub">Добавьте баланс в своей валюте, а ниже — остальные (наличные, карта в другой валюте и т.д.)</div>'+
+        rows+
+        '<div class="drawer-hr"></div>'+
+        '<form id="balance-form">'+
+          (editing?'<input type="hidden" name="editId" value="'+editing.id+'">':'')+
+          '<div class="field"><label>Пометка (необязательно)</label><input type="text" name="label" placeholder="Например, карта или наличные" value="'+(editing?escapeHtml(editing.label||''):'')+'"></div>'+
+          '<div class="field-row">'+
+            '<div class="field" style="flex:2;"><label>Сумма</label><input type="number" name="amount" min="0" step="0.01" placeholder="0" value="'+(editing?editing.amount:'')+'" required></div>'+
+            '<div class="field" style="flex:1;"><label>Валюта</label><select name="currency">'+currencyOptionsHtml(editing?editing.currency:DEFAULT_CURRENCY)+'</select></div>'+
+          '</div>'+
+          '<div class="modal-actions">'+
+            (editing?'<button type="button" class="btn" data-act="cancel-edit-balance">Отмена</button>':'')+
+            '<button type="submit" class="btn primary">'+(editing?'Сохранить':'Добавить')+'</button>'+
+          '</div>'+
+        '</form>'+
+      '</div>'+
+    '</div>';
+  }
+
+  function renderTransactionModal(){
+    var t = state.transactionTarget;
+    if(!t) return '';
+    var ab = activeBoard();
+    var list = t.kind==='income' ? ab.income : ab.expenses;
+    var item = list.find(function(x){ return x.id===t.id; });
+    if(!item) return '';
+    var verb = t.kind==='income' ? 'доходу' : 'расходу';
+    var effect = t.kind==='income' ? 'прибавится к выбранному счёту' : 'спишется с выбранного счёта';
+    var matching = ab.balances.filter(function(x){ return x.currency===item.currency; });
+    var accountField;
+    if(matching.length){
+      accountField = ''+
+        '<div class="field"><label>Счёт</label><select name="balanceId">'+
+          matching.map(function(x){
+            var label = (x.label ? x.label+' · ' : '') + fmtMoney(x.amount, x.currency);
+            return '<option value="'+x.id+'">'+escapeHtml(label)+'</option>';
+          }).join('')+
+          '<option value="">Не изменять баланс</option>'+
+        '</select></div>';
+    } else {
+      accountField = '<div class="field-hint" style="margin-bottom:14px;">Нет счёта в валюте '+item.currency+' — сумма добавится к карточке, но баланс не изменится. Можно добавить счёт через «Баланс» в меню.</div>';
+    }
+    return ''+
+    '<div class="overlay">'+
+      '<div class="modal narrow" data-stop="1">'+
+        '<button class="close-x" data-act="close-modal">✕</button>'+
+        '<h3 class="display">Добавить сумму</h3>'+
+        '<div class="sub">К «'+escapeHtml(item.name)+'» ('+verb+'), сейчас '+fmtMoney(item.amount, item.currency)+'. Сумма '+effect+'.</div>'+
+        '<form id="transaction-form">'+
+          '<div class="field"><label>Сумма ('+(CURRENCIES[item.currency]||item.currency)+')</label><input type="number" name="amount" min="0.01" step="0.01" placeholder="0" required></div>'+
+          accountField+
+          '<div class="field"><label>Дата траты</label><input type="date" name="date" value="'+fmt(todayD())+'" required></div>'+
+          '<div class="modal-actions">'+
+            '<button type="button" class="btn" data-act="close-modal">Отмена</button>'+
+            '<button type="submit" class="btn primary">Добавить</button>'+
+          '</div>'+
+        '</form>'+
+      '</div>'+
+    '</div>';
+  }
+
+  function renderRatesModal(){
+    var ab = activeBoard();
+    var keys = Object.keys(ab.rates);
+    var rows = keys.map(function(k){
+      var parts = k.split('_');
+      var from = parts[0], to = parts[1];
+      return ''+
+        '<div class="day-item">'+
+          '<div class="day-item-head"><span class="nm mono">1 '+from+' = '+ab.rates[k]+' '+to+'</span></div>'+
+          '<div class="row-actions">'+
+            '<button class="btn small" data-act="edit-rate" data-key="'+k+'">Изменить</button>'+
+            '<button class="btn small danger" data-act="delete-rate" data-key="'+k+'">Удалить</button>'+
+          '</div>'+
+        '</div>';
+    }).join('');
+    if(!rows){
+      rows = '<div class="empty" style="padding:16px 6px;">Пока нет сохранённых курсов.</div>';
+    }
+    var editingKey = (state.editing && state.editing.kind==='rate') ? state.editing.key : null;
+    var editParts = editingKey ? editingKey.split('_') : null;
+    return ''+
+    '<div class="overlay">'+
+      '<div class="modal narrow" data-stop="1">'+
+        '<button class="close-x" data-act="close-modal">✕</button>'+
+        '<h3 class="display">Курсы валют</h3>'+
+        '<div class="sub">Сохранённые курсы конвертации для колеса расходов</div>'+
+        rows+
+        '<div class="drawer-hr"></div>'+
+        '<form id="rate-form">'+
+          (editingKey?'<input type="hidden" name="oldKey" value="'+editingKey+'">':'')+
+          '<div class="field-row">'+
+            '<div class="field" style="flex:1;"><label>Из</label><select name="from">'+currencyOptionsHtml(editParts?editParts[0]:CURRENCY_KEYS[0])+'</select></div>'+
+            '<div class="field" style="flex:1;"><label>В</label><select name="to">'+currencyOptionsHtml(editParts?editParts[1]:CURRENCY_KEYS[1])+'</select></div>'+
+          '</div>'+
+          '<div class="field"><label>Курс (1 «Из» = ? «В»)</label><input type="number" step="0.0001" min="0" name="value" value="'+(editingKey?ab.rates[editingKey]:'')+'" required></div>'+
+          '<div class="modal-actions">'+
+            (editingKey?'<button type="button" class="btn" data-act="cancel-edit-rate">Отмена</button>':'')+
+            '<button type="submit" class="btn primary">'+(editingKey?'Сохранить':'Добавить курс')+'</button>'+
+          '</div>'+
+        '</form>'+
+      '</div>'+
+    '</div>';
+  }
+
+  function renderTransactionHistoryModal(){
+    var ab = activeBoard();
+    var all = [];
+    ab.income.forEach(function(inc){
+      (inc.history||[]).forEach(function(h){
+        all.push({kind:'income', itemId:inc.id, name:inc.name, color:inc.color, currency:inc.currency, h:h});
+      });
+    });
+    ab.expenses.forEach(function(exp){
+      (exp.history||[]).forEach(function(h){
+        all.push({kind:'expense', itemId:exp.id, name:exp.name, color:exp.color, currency:exp.currency, h:h});
+      });
+    });
+    all.sort(function(a,b){ return a.h.date < b.h.date ? 1 : (a.h.date > b.h.date ? -1 : 0); });
+    var rows = all.map(function(t){
+      var color = COLORS[t.color] || COLORS.amber;
+      var sign = t.kind==='income' ? '+' : '-';
+      var signColor = t.kind==='income' ? 'var(--sage)' : 'var(--rose)';
+      return ''+
+        '<div class="day-item">'+
+          '<div class="day-item-head">'+
+            '<span class="dot" style="background:'+color+'"></span>'+
+            '<span class="nm">'+escapeHtml(t.name)+'</span>'+
+            '<span class="mono" style="font-size:11px;color:'+signColor+';">'+sign+fmtMoney(t.h.amount, t.currency)+'</span>'+
+          '</div>'+
+          '<div class="status">'+fmtHuman(t.h.date)+'</div>'+
+          '<div class="row-actions"><button class="btn small danger" data-act="delete-transaction" data-kind="'+t.kind+'" data-item="'+t.itemId+'" data-hist="'+t.h.id+'">Удалить</button></div>'+
+        '</div>';
+    }).join('');
+    if(!rows){
+      rows = '<div class="empty" style="padding:16px 6px;">Пока нет ни одной транзакции.</div>';
+    }
+    return ''+
+    '<div class="overlay">'+
+      '<div class="modal" data-stop="1">'+
+        '<button class="close-x" data-act="close-modal">✕</button>'+
+        '<h3 class="display">История транзакций</h3>'+
+        '<div class="sub">Все пополнения и траты по карточкам этой доски, от новых к старым</div>'+
+        rows+
+      '</div>'+
+    '</div>';
+  }
+
   function renderMenuDrawer(){
     var boardsHtml = state.boards.map(function(b){
       var active = b.id===state.activeBoardId;
-      var tag = b.type==='events' ? '<span class="mono dim" style="font-size:10px;">события</span>' : '<span class="mono dim" style="font-size:10px;">занятия</span>';
+      var tagText = b.type==='events' ? 'события' : (b.type==='finance' ? 'финансы' : 'занятия');
+      var tag = '<span class="mono dim" style="font-size:10px;">'+tagText+'</span>';
       return '<div class="board-row'+(active?' active':'')+'">'+
         '<button class="board-name" data-act="switch-board" data-id="'+b.id+'">'+escapeHtml(b.name)+' '+tag+'</button>'+
         (state.boards.length>1 ? '<button class="icon-btn tiny" data-act="delete-board" data-id="'+b.id+'" title="Удалить доску">✕</button>' : '')+
@@ -720,11 +1487,20 @@
         '<h3 class="display">Доски</h3>'+
         '<div class="sub">Переключайтесь между календарями или создайте новый</div>'+
         '<div class="board-list">'+boardsHtml+'</div>'+
+        '<div class="drawer-hr"></div>'+
+        '<div class="field">'+
+          '<label>Тема</label>'+
+          '<div class="toggle-row">'+
+            '<button type="button" class="toggle-btn'+(state.theme==='dark'?' active':'')+'" data-act="set-theme" data-theme="dark">Тёмная</button>'+
+            '<button type="button" class="toggle-btn'+(state.theme==='light'?' active':'')+'" data-act="set-theme" data-theme="light">Светлая</button>'+
+          '</div>'+
+        '</div>'+
         '<div class="field" style="margin-top:14px;">'+
           '<label>Новая доска</label>'+
           '<div class="toggle-row">'+
-            '<button type="button" class="toggle-btn'+(state.newBoardType==='lessons'?' active':'')+'" data-boardtype="lessons">Календарь занятий</button>'+
-            '<button type="button" class="toggle-btn'+(state.newBoardType==='events'?' active':'')+'" data-boardtype="events">Календарь событий</button>'+
+            '<button type="button" class="toggle-btn'+(state.newBoardType==='lessons'?' active':'')+'" data-boardtype="lessons">Занятия</button>'+
+            '<button type="button" class="toggle-btn'+(state.newBoardType==='events'?' active':'')+'" data-boardtype="events">События</button>'+
+            '<button type="button" class="toggle-btn'+(state.newBoardType==='finance'?' active':'')+'" data-boardtype="finance">Финансы</button>'+
           '</div>'+
           '<div class="field-row"><input type="text" id="new-board-name" placeholder="Название доски"><button class="btn primary" data-act="create-board">+</button></div>'+
         '</div>'+
@@ -758,7 +1534,7 @@
     });
     app.querySelectorAll('.overlay').forEach(function(overlay){
       overlay.addEventListener('click', function(ev){
-        if(ev.target===overlay){ state.modal=null; state.menuOpen=false; render(); }
+        if(ev.target===overlay){ state.modal=null; state.menuOpen=false; state.editing=null; state.transactionTarget=null; render(); }
       });
     });
 
@@ -813,8 +1589,8 @@
         } else {
           payload.total = Math.max(1, parseInt(fd.get('total'),10) || 1);
         }
-        addSubject(payload);
         state.modal = null;
+        addSubject(payload);
       });
     }
 
@@ -831,13 +1607,144 @@
       addEventForm.addEventListener('submit', function(ev){
         ev.preventDefault();
         var fd = new FormData(addEventForm);
-        addEvent({
+        var payload = {
           name: (fd.get('name')||'').toString().trim() || 'Без названия',
           color: fd.get('color'),
           date: fd.get('date'),
           yearly: !!fd.get('yearly')
-        });
+        };
+        var editId = fd.get('editId');
         state.modal = null;
+        state.editing = null;
+        if(editId){ updateEvent(editId, payload); } else { addEvent(payload); }
+      });
+    }
+
+    var addIncomeForm = document.getElementById('add-income-form');
+    if(addIncomeForm){
+      var colorInput3 = addIncomeForm.querySelector('input[name=color]');
+      var scheduleInput = addIncomeForm.querySelector('input[name=scheduleType]');
+      addIncomeForm.querySelectorAll('.swatch').forEach(function(sw){
+        sw.addEventListener('click', function(){
+          addIncomeForm.querySelectorAll('.swatch').forEach(function(x){ x.classList.remove('active'); });
+          sw.classList.add('active');
+          colorInput3.value = sw.dataset.color;
+        });
+      });
+      addIncomeForm.querySelectorAll('[data-schedule]').forEach(function(btn){
+        btn.addEventListener('click', function(){
+          addIncomeForm.querySelectorAll('[data-schedule]').forEach(function(x){ x.classList.remove('active'); });
+          btn.classList.add('active');
+          scheduleInput.value = btn.dataset.schedule;
+          addIncomeForm.querySelectorAll('[data-schedule-field]').forEach(function(f){
+            f.style.display = (f.dataset.scheduleField===btn.dataset.schedule) ? '' : 'none';
+          });
+        });
+      });
+      addIncomeForm.addEventListener('submit', function(ev){
+        ev.preventDefault();
+        var fd = new FormData(addIncomeForm);
+        var amount = parseFloat(fd.get('amount'));
+        if(isNaN(amount) || amount<0){ showToast('Укажите сумму'); return; }
+        var scheduleType = fd.get('scheduleType') || 'once';
+        var payload = {
+          name: (fd.get('name')||'').toString().trim() || 'Без названия',
+          color: fd.get('color'),
+          amount: amount,
+          currency: fd.get('currency') || DEFAULT_CURRENCY,
+          scheduleType: scheduleType
+        };
+        if(scheduleType==='monthly'){
+          payload.dayOfMonth = Math.min(28, Math.max(1, parseInt(fd.get('dayOfMonth'),10) || 1));
+        } else {
+          if(!fd.get('date')){ showToast('Укажите дату'); return; }
+          payload.date = fd.get('date');
+        }
+        var editId = fd.get('editId');
+        state.modal = null;
+        state.editing = null;
+        if(editId){ updateIncome(editId, payload); } else { addIncome(payload); }
+      });
+    }
+
+    var addExpenseForm = document.getElementById('add-expense-form');
+    if(addExpenseForm){
+      var colorInput4 = addExpenseForm.querySelector('input[name=color]');
+      addExpenseForm.querySelectorAll('.swatch').forEach(function(sw){
+        sw.addEventListener('click', function(){
+          addExpenseForm.querySelectorAll('.swatch').forEach(function(x){ x.classList.remove('active'); });
+          sw.classList.add('active');
+          colorInput4.value = sw.dataset.color;
+        });
+      });
+      addExpenseForm.addEventListener('submit', function(ev){
+        ev.preventDefault();
+        var fd = new FormData(addExpenseForm);
+        var amount = parseFloat(fd.get('amount'));
+        if(isNaN(amount) || amount<0){ showToast('Укажите сумму'); return; }
+        var payload = {
+          name: (fd.get('name')||'').toString().trim() || 'Без названия',
+          color: fd.get('color'),
+          amount: amount,
+          currency: fd.get('currency') || DEFAULT_CURRENCY
+        };
+        var editId = fd.get('editId');
+        state.modal = null;
+        state.editing = null;
+        if(editId){ updateExpense(editId, payload); } else { addExpense(payload); }
+      });
+    }
+
+    var balanceForm = document.getElementById('balance-form');
+    if(balanceForm){
+      balanceForm.addEventListener('submit', function(ev){
+        ev.preventDefault();
+        var fd = new FormData(balanceForm);
+        var amount = parseFloat(fd.get('amount'));
+        if(!(amount>0)){ showToast('Укажите сумму'); return; }
+        var payload = {
+          label: (fd.get('label')||'').toString().trim(),
+          amount: amount,
+          currency: fd.get('currency') || DEFAULT_CURRENCY
+        };
+        var editId = fd.get('editId');
+        state.editing = null;
+        if(editId){ updateBalance(editId, payload); } else { addBalance(payload); }
+      });
+    }
+
+    var transactionForm = document.getElementById('transaction-form');
+    if(transactionForm){
+      transactionForm.addEventListener('submit', function(ev){
+        ev.preventDefault();
+        var fd = new FormData(transactionForm);
+        var amount = parseFloat(fd.get('amount'));
+        if(!(amount>0)){ showToast('Укажите сумму'); return; }
+        var balanceId = fd.get('balanceId') || null;
+        var date = fd.get('date') || fmt(todayD());
+        var t = state.transactionTarget;
+        state.modal = null;
+        state.transactionTarget = null;
+        var balanceFound = addTransaction(t.kind, t.id, amount, balanceId, date);
+        if(balanceId && balanceFound===false){ showToast('Добавлено, но счёт не найден — баланс не изменён.'); }
+      });
+    }
+
+    var rateForm = document.getElementById('rate-form');
+    if(rateForm){
+      rateForm.addEventListener('submit', function(ev){
+        ev.preventDefault();
+        var fd = new FormData(rateForm);
+        var from = fd.get('from'), to = fd.get('to');
+        var val = parseFloat(fd.get('value'));
+        if(!(val>0)){ showToast('Укажите курс'); return; }
+        if(from===to){ showToast('Валюты должны различаться'); return; }
+        var oldKey = fd.get('oldKey');
+        var b = activeBoard();
+        if(oldKey && oldKey!==(from+'_'+to)) delete b.rates[oldKey];
+        b.rates[from+'_'+to] = val;
+        state.editing = null;
+        saveData();
       });
     }
 
@@ -850,7 +1757,21 @@
     });
   }
 
-  function showToast(msg){ state.toast = msg; render(); }
+  var toastTimer = null;
+  function showToast(msg){
+    var t = document.getElementById('app-toast');
+    if(!t){
+      t = document.createElement('div');
+      t.id = 'app-toast';
+      t.className = 'toast';
+      document.body.appendChild(t);
+    }
+    t.textContent = msg;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function(){
+      if(t && t.parentNode) t.parentNode.removeChild(t);
+    }, 2400);
+  }
 
   function copyText(text, okMsg){
     if(!text){ showToast('Нечего копировать'); return; }
@@ -874,10 +1795,19 @@
       case 'today':
         state.viewDate = startOfMonth(todayD());
         render(); break;
+      case 'finance-view':
+        state.financeView = el.dataset.view === 'expenses' ? 'expenses' : 'income';
+        render(); break;
+      case 'set-theme':
+        setTheme(el.dataset.theme);
+        break;
+      case 'refresh-rates':
+        refreshRatesFromApi(el.dataset.to);
+        break;
       case 'open-add':
-        state.modal = 'add'; state.menuOpen = false; render(); break;
+        state.modal = 'add'; state.menuOpen = false; state.editing = null; render(); break;
       case 'close-modal':
-        state.modal = null; render(); break;
+        state.modal = null; state.editing = null; state.transactionTarget = null; render(); break;
       case 'open-menu':
         state.menuOpen = true; state.modal = null; state.newBoardType = 'lessons'; render(); break;
       case 'close-menu':
@@ -892,6 +1822,78 @@
         ev.stopPropagation();
         deleteEvent(el.dataset.id);
         break;
+      case 'edit-event':
+        ev.stopPropagation();
+        state.editing = {kind:'event', id: el.dataset.id};
+        state.modal = 'add';
+        render();
+        break;
+      case 'delete-income':
+        ev.stopPropagation();
+        deleteIncome(el.dataset.id);
+        break;
+      case 'delete-expense':
+        ev.stopPropagation();
+        deleteExpense(el.dataset.id);
+        break;
+      case 'delete-transaction':
+        ev.stopPropagation();
+        deleteTransaction(el.dataset.kind, el.dataset.item, el.dataset.hist);
+        break;
+      case 'edit-income':
+        ev.stopPropagation();
+        state.editing = {kind:'income', id: el.dataset.id};
+        state.modal = 'add';
+        render();
+        break;
+      case 'edit-expense':
+        ev.stopPropagation();
+        state.editing = {kind:'expense', id: el.dataset.id};
+        state.modal = 'add';
+        render();
+        break;
+      case 'add-transaction':
+        ev.stopPropagation();
+        state.transactionTarget = {kind: el.dataset.kind, id: el.dataset.id};
+        state.modal = 'transaction';
+        render();
+        break;
+      case 'open-balance':
+        state.modal = 'balance'; state.menuOpen = false; state.editing = null; render(); break;
+      case 'edit-balance':
+        state.editing = {kind:'balance', id: el.dataset.id};
+        render();
+        break;
+      case 'cancel-edit-balance':
+        state.editing = null;
+        render();
+        break;
+      case 'delete-balance':
+        ev.stopPropagation();
+        if(state.editing && state.editing.kind==='balance' && state.editing.id===el.dataset.id) state.editing = null;
+        deleteBalance(el.dataset.id);
+        break;
+      case 'open-rates':
+        state.modal = 'rates'; state.menuOpen = false; state.editing = null; render(); break;
+      case 'edit-rate':
+        state.editing = {kind:'rate', key: el.dataset.key};
+        render();
+        break;
+      case 'cancel-edit-rate':
+        state.editing = null;
+        render();
+        break;
+      case 'delete-rate':
+        ev.stopPropagation();
+        if(state.editing && state.editing.kind==='rate' && state.editing.key===el.dataset.key) state.editing = null;
+        (function(){
+          var b = activeBoard();
+          delete b.rates[el.dataset.key];
+          saveData();
+        })();
+        break;
+      case 'open-history':
+        state.modal = 'history'; state.menuOpen = false; state.editing = null; render(); break;
       case 'cancel':
         cancelOccurrence(el.dataset.subj, el.dataset.date);
         break;
@@ -935,6 +1937,11 @@
           var nb = newBoard(decoded.name, decoded.type);
           nb.subjects = decoded.subjects;
           nb.events = decoded.events;
+          nb.income = decoded.income;
+          nb.expenses = decoded.expenses;
+          nb.balances = decoded.balances;
+          nb.rates = decoded.rates;
+          nb.wheelCurrency = decoded.wheelCurrency;
           normalizeBoard(nb);
           state.boards.push(nb);
           state.activeBoardId = nb.id;
@@ -962,6 +1969,19 @@
     }
     if(t && t.dataset && t.dataset.act==='edit-paiduntil'){
       updatePaidUntil(t.dataset.id, t.value);
+    }
+    if(t && t.dataset && t.dataset.act==='set-wheel-currency'){
+      var b = activeBoard();
+      b.wheelCurrency = t.value;
+      saveData();
+    }
+    if(t && t.dataset && t.dataset.act==='set-rate'){
+      var rateVal = parseFloat(t.value);
+      if(rateVal>0){
+        var b2 = activeBoard();
+        b2.rates[t.dataset.from+'_'+t.dataset.to] = rateVal;
+        saveData();
+      }
     }
   });
 
